@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       # GitHub Actions uses glob patterns here, not regex. Match versioned
       # tags broadly at the trigger layer, then enforce strict semver below.
@@ -16,10 +18,11 @@ permissions:
 # Serialize them so publishers never race while replacing same-name assets.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
   verify:
+    if: github.repository == 'cheruvian/multica-fork' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     outputs:
       tag_name: ${{ steps.release_meta.outputs.tag_name }}
@@ -34,6 +37,11 @@ jobs:
         id: release_meta
         shell: bash
         run: |
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "tag_name=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "is_stable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           tag="${GITHUB_REF_NAME}"
           echo "Triggered by tag: $tag"
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -87,7 +95,7 @@ jobs:
     # `multica-ai/homebrew-tap` anyway. Without this guard, every fork's
     # tag push fails this job (401 against the upstream tap), which makes
     # downstream CI go red without affecting the actual artifact pipeline.
-    if: github.repository_owner == 'multica-ai'
+    if: github.repository_owner == 'multica-ai' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -420,6 +428,8 @@ jobs:
           labels: |
             org.opencontainers.image.title=Multica Collab
             org.opencontainers.image.description=Multica live co-editing service for Workspace Docs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -506,10 +516,55 @@ jobs:
           docker buildx imagetools inspect \
             ghcr.io/${{ github.repository_owner }}/multica-collab:${{ steps.meta.outputs.version }}
 
+  deployment-images:
+    needs: [verify, docker-backend-merge, docker-web-merge, docker-collab-merge]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record merged and architecture digests
+        env:
+          IMAGE_TAG: ${{ needs.verify.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
+            --arg ref "$GITHUB_REF" '{source_repository:$repository,source_sha:$sha,source_ref:$ref,images:{}}' > deployment-images.json
+          for service in backend web collab; do
+            image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/multica-${service}:${IMAGE_TAG}"
+            digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect --raw "$image" > manifest.json
+            jq -e '.manifests | [ .[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) ] | length == 2' manifest.json
+            jq --arg service "$service" --arg image "$image" --arg digest "$digest" \
+              --slurpfile manifest manifest.json \
+              '.images[$service] = {reference:($image + "@" + $digest), manifest_digest:$digest,
+                architectures:($manifest[0].manifests | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))) | map({key:(.platform.os + "/" + .platform.architecture),value:.digest}) | from_entries)}' \
+              deployment-images.json > next.json
+            mv next.json deployment-images.json
+          done
+          jq -e '.images | keys == ["backend", "collab", "web"]' deployment-images.json
+
+      - name: Upload complete deployment record
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-images
+          path: deployment-images.json
+          if-no-files-found: error
+          retention-days: 90
+
   helm-chart:
     # The chart's collab image defaults to the same tag, so it waits for it too.
     needs: [verify, docker-backend-merge, docker-web-merge, docker-collab-merge]
-    if: github.repository_owner == 'multica-ai'
+    if: github.repository_owner == 'multica-ai' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     concurrency:
       group: release-helm-chart-${{ github.ref }}
@@ -616,7 +671,7 @@ jobs:
 
   promote:
     needs: [verify, desktop]
-    if: needs.verify.outputs.is_stable == 'true'
+    if: needs.verify.outputs.is_stable == 'true' && startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/promote-release.yml
     with:
       tag: ${{ needs.verify.outputs.tag_name }}
