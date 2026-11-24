@@ -1,0 +1,73 @@
+name: Fork macOS Desktop package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Sign and notarize with the private desktop-release environment
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.repository == 'cheruvian/multica-fork' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    environment: ${{ inputs.signed && 'desktop-release' || 'desktop-build' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '~1.27.4'
+          check-latest: true
+          cache-dependency-path: server/go.sum
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Require complete Apple release credentials
+        if: inputs.signed
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then echo "::error::$name is required"; exit 1; fi
+          done
+      - name: Package arm64 DMG
+        working-directory: apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.signed && 'true' || 'false' }}
+          CSC_LINK: ${{ inputs.signed && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ inputs.signed && secrets.CSC_KEY_PASSWORD || '' }}
+          APPLE_ID: ${{ inputs.signed && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ inputs.signed && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ inputs.signed && secrets.APPLE_TEAM_ID || '' }}
+        run: node scripts/package.mjs --mac --arm64 --publish never
+      - name: Record source and verify package
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SIGNED: ${{ inputs.signed && 'true' || 'false' }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 scripts/desktop-mac-artifact.py apps/desktop/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multica-desktop-mac-arm64-${{ github.sha }}
+          path: |
+            apps/desktop/dist/*.dmg
+            apps/desktop/dist/desktop-artifact.json
+          if-no-files-found: error
+          retention-days: 30
